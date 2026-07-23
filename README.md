@@ -13,7 +13,7 @@
 ## 1. 获取代码
 
 ```bash
-git clone <本仓库地址> Open-GroundingDino
+git clone https://github.com/mantuoluozk/Open-GroundingDino-DCU.git Open-GroundingDino
 cd Open-GroundingDino
 ```
 
