@@ -69,6 +69,28 @@ cd /data/zk/Open-GroundingDino
 
 基础镜像已提供 PyTorch、torchvision、Transformers、timm、NumPy、SciPy 和 OpenCV，`requirements.txt` 已避免重复安装这些核心组件。
 
+本次适配中使用的 `requirements.txt` 内容如下。被注释的包由基础镜像提供，不要通过 pip 重复覆盖：
+
+```text
+cython
+submitit
+# scipy
+termcolor
+addict
+yapf==0.40.1
+# timm
+# torch
+# torchvision
+# transformers
+# numpy
+# opencv-python
+supervision==0.6.0
+pycocotools
+pyyaml>3.10
+colorlog
+jsonlines
+```
+
 ```bash
 pip install -r requirements.txt
 pip install numpy==1.25.0 --force-reinstall \
@@ -81,6 +103,7 @@ pip install numpy==1.25.0 --force-reinstall \
 
 ```bash
 source /opt/dtk/cuda/cuda-12/env.sh
+export HF_ENDPOINT=https://hf-mirror.com
 
 # 避免 CUDA 兼容头与编译过程冲突；同一容器只需处理一次。
 if [[ -d /opt/dtk/cuda/cuda-12/include ]]; then
@@ -94,13 +117,40 @@ python setup.py build install
 python test.py
 ```
 
-测试中应看到前向精度和梯度检查均为 `True`。以下信息在当前环境中是编译器提示，已验证不会阻止训练继续执行：
+本次实测输出如下。前向精度和梯度检查均为 `True`：
+
+```text
+root@node3:/data/zk/Open-GroundingDino/models/GroundingDINO/ops# python test.py
+Launch params (1024, 1, 1) are larger than launch bounds (256) for kernel _Z31ms_deformable_im2col_gpu_kernelIdEviPKT_PKlS4_S2_S2_iiiiiiiPS0_ please add __launch_bounds__ to kernel define or use --gpu-max-threads-per-block recompile program !
+* True check_forward_equal_with_pytorch_double: max_abs_err 8.67e-19 max_rel_err 2.35e-16
+* True check_forward_equal_with_pytorch_float: max_abs_err 4.66e-10 max_rel_err 1.13e-07
+* True check_gradient_numerical(D=30)
+* True check_gradient_numerical(D=32)
+* True check_gradient_numerical(D=64)
+* True check_gradient_numerical(D=71)
+```
+
+其中以下信息在当前环境中是编译器提示，已验证不会阻止训练继续执行：
 
 ```text
 Launch params (1024, 1, 1) are larger than launch bounds (256) ...
 ```
 
 ## 5. 准备 COCO 2017 数据
+
+从当前内网数据服务下载 COCO 2017：
+
+```bash
+cd /data/zk
+
+wget -c http://10.17.26.232:8000/ISO/AI/02.DataSets/coco2017_official/train2017.zip
+wget -c http://10.17.26.232:8000/ISO/AI/02.DataSets/coco2017_official/val2017.zip
+wget -c http://10.17.26.232:8000/ISO/AI/02.DataSets/coco2017_official/annotations_trainval2017.zip
+
+unzip train2017.zip -d coco_2017/
+unzip val2017.zip -d coco_2017/
+unzip annotations_trainval2017.zip -d coco_2017/
+```
 
 将 COCO 2017 解压为：
 
@@ -122,11 +172,62 @@ python coco2odvg.py \
     --input /data/zk/coco_2017/annotations/instances_train2017.json \
     --output /data/zk/coco_2017/annotations/coco2017_train_odvg.jsonl \
     --idmap coco2017
-
-python -c "from coco2odvg import dump_label_map; dump_label_map(output='/data/zk/coco_2017/annotations/coco2017_label_map.json')"
 ```
 
-`config/datasets_od_example.json` 已按上述路径配置。训练集使用 ODVG，验证集使用 COCO 标注。
+转换验证集标注，生成 `coco2017_val_odvg.jsonl`：
+
+```bash
+python coco2odvg.py \
+    --input /data/zk/coco_2017/annotations/instances_val2017.json \
+    --output /data/zk/coco_2017/annotations/coco2017_val_odvg.jsonl \
+    --idmap coco2017
+```
+
+生成标签映射文件：
+
+```bash
+python -c "
+from coco2odvg import dump_label_map
+dump_label_map(output='/data/zk/coco_2017/annotations/coco2017_label_map.json')
+"
+```
+
+转换后的完整数据结构：
+
+```text
+/data/zk/coco_2017/
+├── train2017/
+├── val2017/
+└── annotations/
+    ├── instances_train2017.json
+    ├── instances_val2017.json
+    ├── coco2017_train_odvg.jsonl
+    ├── coco2017_val_odvg.jsonl
+    └── coco2017_label_map.json
+```
+
+项目中的 `config/datasets_od_example.json` 内容如下：
+
+```json
+{
+  "train": [
+    {
+      "root": "/data/zk/coco_2017/train2017",
+      "anno": "/data/zk/coco_2017/annotations/coco2017_train_odvg.jsonl",
+      "label_map": "/data/zk/coco_2017/annotations/coco2017_label_map.json",
+      "dataset_mode": "odvg"
+    }
+  ],
+  "val": [
+    {
+      "root": "/data/zk/coco_2017/val2017",
+      "anno": "config/instances_val2017.json",
+      "label_map": null,
+      "dataset_mode": "coco"
+    }
+  ]
+}
+```
 
 ## 6. 准备预训练权重和 BERT
 
@@ -146,6 +247,15 @@ export HF_ENDPOINT=https://hf-mirror.com
 huggingface-cli download bert-base-uncased \
     --local-dir /data/zk/Open-GroundingDino/ckpts/bert-base-uncased
 ```
+
+训练脚本中的默认路径也可以直接改为实际路径：
+
+```bash
+PRETRAIN_MODEL_PATH=${PRETRAIN_MODEL_PATH:-"/data/zk/Open-GroundingDino/ckpts/groundingdino_swint_ogc.pth"}
+TEXT_ENCODER_TYPE=${TEXT_ENCODER_TYPE:-"/data/zk/Open-GroundingDino/ckpts/bert-base-uncased"}
+```
+
+本 README 后续命令使用环境变量显式传入路径，便于在 Swin-T 和 Swin-B 之间切换，并避免反复编辑脚本。
 
 ## 7. 训练 Swin-T
 
