@@ -103,19 +103,16 @@ pip install numpy==1.25.0 --force-reinstall \
 
 ```bash
 source /opt/dtk/cuda/cuda-12/env.sh
+cp -r /opt/dtk/cuda/cuda-12/include /opt/dtk/cuda/cuda-12/include-bak
+rm -rf /opt/dtk/cuda/cuda-12/include
 export HF_ENDPOINT=https://hf-mirror.com
-
-# 避免 CUDA 兼容头与编译过程冲突；同一容器只需处理一次。
-if [[ -d /opt/dtk/cuda/cuda-12/include ]]; then
-    cp -a /opt/dtk/cuda/cuda-12/include \
-        /opt/dtk/cuda/cuda-12/include-bak
-    rm -rf /opt/dtk/cuda/cuda-12/include
-fi
 
 cd /data/zk/Open-GroundingDino/models/GroundingDINO/ops
 python setup.py build install
 python test.py
 ```
+
+`include` 的备份和移除操作在同一个容器内只执行一次；再次部署前先确认目录状态。
 
 本次实测输出如下。前向精度和梯度检查均为 `True`：
 
