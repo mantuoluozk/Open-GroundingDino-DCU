@@ -1,251 +1,280 @@
-<div align="center">
-  <img src="figs/cute_dino.png" width="35%">
-</div>
+# Open-GroundingDino：海光 BW100 训练适配
 
-This is the third party implementation of the paper **[Grounding DINO: Marrying DINO with Grounded Pre-Training for Open-Set Object Detection](https://arxiv.org/abs/2303.05499)** by [Zuwei Long]() and [Wei Li](https://github.com/bigballon).
+本仓库基于 [Open-GroundingDino](https://github.com/longzw1997/Open-GroundingDino)，完成了海光 BW100（DCU）环境下的训练适配，包含 DCU 版 Multi-Scale Deformable Attention 自定义算子、COCO/ODVG 数据准备以及 GroundingDINO Swin-T、Swin-B 单卡与多卡训练脚本。
 
-**You can use this code to fine-tune a model on your own dataset, or start pretraining a model from scratch.**
+当前验证环境：
 
-- [Supported Features](#supported-features)
-- [Setup](#setup)
-- [Dataset](#dataset)
-- [Config](#config)
-- [Training](#training)
-- [Results and Models](#results-and-models)
-- [Inference](#inference)
-- [Acknowledgments](#acknowledgments)
-- [Citation](#citation)
-- [Contact](#contact)
+- DCU：海光 BW100
+- 基础镜像：`harbor.sourcefind.cn:5443/dcu/admin/base/pytorch:2.9.0-ubuntu22.04-dtk26.04-py3.10`
+- DTK：26.04
+- Python：3.10
+- PyTorch：2.9.0
 
-# Supported Features
-
-|                                | Official release version | The version we replicated |
-| ------------------------------ | :----------------------: | :-----------------------: |
-| Inference                      |         &#10004;         |         &#10004;          |
-| Train (Object Detection data) |         &#10006;         |         &#10004;          |
-| Train (Grounding data)         |         &#10006;         |         &#10004;          |
-| Slurm multi-machine support    |         &#10006;         |         &#10004;          |
-| Training acceleration strategy |         &#10006;         |         &#10004;          |
-
-
-
-# Setup
-
-We conduct our model testing using the following versions: Python 3.7.11, PyTorch 1.11.0, and CUDA 11.3. It is possible that other versions are also available.
-
-1. Clone this repository.
+## 1. 获取代码
 
 ```bash
-git clone https://github.com/longzw1997/Open-GroundingDino.git && cd Open-GroundingDino/
+git clone <本仓库地址> Open-GroundingDino
+cd Open-GroundingDino
 ```
 
-2. Install the required dependencies.
+## 2. 创建并进入容器
+
+下面的脚本会复用同名容器；不存在时创建容器。项目和数据统一放在宿主机 `/data/zk` 下，并挂载到容器中的相同路径。
 
 ```bash
-pip install -r requirements.txt 
-cd models/GroundingDINO/ops
+#!/bin/bash
+set -e
+
+CONTAINER_NAME="zk-opengd-0722"
+IMAGE_NAME="harbor.sourcefind.cn:5443/dcu/admin/base/pytorch:2.9.0-ubuntu22.04-dtk26.04-py3.10"
+
+if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+    if [[ "$(docker inspect "$CONTAINER_NAME" --format '{{.State.Status}}')" == "exited" ]]; then
+        docker start "$CONTAINER_NAME"
+    fi
+    exec docker exec -it "$CONTAINER_NAME" /bin/bash
+fi
+
+docker run -dit \
+    --network=host \
+    --name="$CONTAINER_NAME" \
+    --privileged \
+    --device=/dev/kfd \
+    --device=/dev/dri \
+    --device=/dev/mkfd \
+    --ipc=host \
+    --shm-size=256G \
+    --group-add video \
+    --cap-add=SYS_PTRACE \
+    --security-opt seccomp=unconfined \
+    -u root \
+    --ulimit stack=-1:-1 \
+    --ulimit memlock=-1:-1 \
+    -v /dev/infiniband:/dev/infiniband \
+    -v /opt/hyhal:/opt/hyhal:ro \
+    -v /models:/models \
+    -v /data/zk:/data/zk \
+    "$IMAGE_NAME"
+
+exec docker exec -it "$CONTAINER_NAME" /bin/bash
+```
+
+进入项目目录：
+
+```bash
+cd /data/zk/Open-GroundingDino
+```
+
+## 3. 安装依赖
+
+基础镜像已提供 PyTorch、torchvision、Transformers、timm、NumPy、SciPy 和 OpenCV，`requirements.txt` 已避免重复安装这些核心组件。
+
+```bash
+pip install -r requirements.txt
+pip install numpy==1.25.0 --force-reinstall \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+## 4. 编译 DCU 自定义算子
+
+本仓库的 `models/GroundingDINO/ops/setup.py` 及 `src/hip/` 已包含 BW100 适配代码。
+
+```bash
+source /opt/dtk/cuda/cuda-12/env.sh
+
+# 避免 CUDA 兼容头与编译过程冲突；同一容器只需处理一次。
+if [[ -d /opt/dtk/cuda/cuda-12/include ]]; then
+    cp -a /opt/dtk/cuda/cuda-12/include \
+        /opt/dtk/cuda/cuda-12/include-bak
+    rm -rf /opt/dtk/cuda/cuda-12/include
+fi
+
+cd /data/zk/Open-GroundingDino/models/GroundingDINO/ops
 python setup.py build install
 python test.py
-cd ../../..
 ```
 
-3. Download [pre-trained model](https://github.com/IDEA-Research/GroundingDINO/releases) and [BERT](https://huggingface.co/bert-base-uncased) weights, then modify the corresponding paths in the train/test script.
+测试中应看到前向精度和梯度检查均为 `True`。以下信息在当前环境中是编译器提示，已验证不会阻止训练继续执行：
 
-# Dataset
-
-For **training**, we use the [odvg data format](data_format.md) to support **both OD data and VG data**.  
-Before model training begins, you need to convert your dataset into odvg format, see [data_format.md](data_format.md) | [datasets_mixed_odvg.json](config/datasets_mixed_odvg.json) | [coco2odvg.py](./tools/coco2odvg.py) | [grit2odvg](./tools/grit2odvg.py) for more details.  
-
-For **testing**, we use [coco format](https://cocodataset.org/#format-data), which currently only supports OD datasets.
-
-<details>
-  <summary>mixed dataset</summary>
-  </br>
-
-``` json
-{
-  "train": [
-    {
-      "root": "path/V3Det/",
-      "anno": "path/V3Det/annotations/v3det_2023_v1_all_odvg.jsonl",
-      "label_map": "path/V3Det/annotations/v3det_label_map.json",
-      "dataset_mode": "odvg"
-    },
-    {
-      "root": "path/LVIS/train2017/",
-      "anno": "path/LVIS/annotations/lvis_v1_train_odvg.jsonl",
-      "label_map": "path/LVIS/annotations/lvis_v1_train_label_map.json",
-      "dataset_mode": "odvg"
-    },
-    {
-      "root": "path/Objects365/train/",
-      "anno": "path/Objects365/objects365_train_odvg.json",
-      "label_map": "path/Objects365/objects365_label_map.json",
-      "dataset_mode": "odvg"
-    },
-    {
-      "root": "path/coco_2017/train2017/",
-      "anno": "path/coco_2017/annotations/coco2017_train_odvg.jsonl",
-      "label_map": "path/coco_2017/annotations/coco2017_label_map.json",
-      "dataset_mode": "odvg"
-    },
-    {
-      "root": "path/GRIT-20M/data/",
-      "anno": "path/GRIT-20M/anno/grit_odvg_620k.jsonl",
-      "dataset_mode": "odvg"
-    }, 
-    {
-      "root": "path/flickr30k/images/flickr30k_images/",
-      "anno": "path/flickr30k/annotations/flickr30k_entities_odvg_158k.jsonl",
-      "dataset_mode": "odvg"
-    }
-  ],
-  "val": [
-    {
-      "root": "path/coco_2017/val2017",
-      "anno": "config/instances_val2017.json",
-      "label_map": null,
-      "dataset_mode": "coco"
-    }
-  ]
-}
-```
-</details>
-
-<details>
-  <summary>example for odvg dataset</summary>
-  </br>
-
-``` bash
-# For OD
-{"filename": "000000391895.jpg", "height": 360, "width": 640, "detection": {"instances": [{"bbox": [359.17, 146.17, 471.62, 359.74], "label": 3, "category": "motorcycle"}, {"bbox": [339.88, 22.16, 493.76, 322.89], "label": 0, "category": "person"}, {"bbox": [471.64, 172.82, 507.56, 220.92], "label": 0, "category": "person"}, {"bbox": [486.01, 183.31, 516.64, 218.29], "label": 1, "category": "bicycle"}]}}
-{"filename": "000000522418.jpg", "height": 480, "width": 640, "detection": {"instances": [{"bbox": [382.48, 0.0, 639.28, 474.31], "label": 0, "category": "person"}, {"bbox": [234.06, 406.61, 454.0, 449.28], "label": 43, "category": "knife"}, {"bbox": [0.0, 316.04, 406.65, 473.53], "label": 55, "category": "cake"}, {"bbox": [305.45, 172.05, 362.81, 249.35], "label": 71, "category": "sink"}]}}
-
-# For VG
-{"filename": "014127544.jpg", "height": 400, "width": 600, "grounding": {"caption": "Homemade Raw Organic Cream Cheese for less than half the price of store bought! It's super easy and only takes 2 ingredients!", "regions": [{"bbox": [5.98, 2.91, 599.5, 396.55], "phrase": "Homemade Raw Organic Cream Cheese"}]}}
-{"filename": "012378809.jpg", "height": 252, "width": 450, "grounding": {"caption": "naive : Heart graphics in a notebook background", "regions": [{"bbox": [93.8, 47.59, 126.19, 77.01], "phrase": "Heart graphics"}, {"bbox": [2.49, 1.44, 448.74, 251.1], "phrase": "a notebook background"}]}}
-```
-</details>
-
-# Config
-
-```
-config/cfg_odvg.py                   # for backbone, batch size, LR, freeze layers, etc.
-config/datasets_mixed_odvg.json      # support mixed dataset for both OD and VG
+```text
+Launch params (1024, 1, 1) are larger than launch bounds (256) ...
 ```
 
-# Training
+## 5. 准备 COCO 2017 数据
 
-- **Datasets:** before starting the training, you need to modify the ``config/datasets_mixed_example.json`` according to [data_format.md](data_format.md).
-- **Configs:** defaults to using coco_val2017 for evaluation.
-    - If you are evaluating with your own test set, you need to convert the test data to coco format (not the ovdg format) and modify the config to set **use_coco_eval = False** (The COCO dataset has 80 classes used for training but 90 categories in total, so there is a built-in mapping in the code).
-    - Also, add(or update) the **label_list** in the config with your own class names like **label_list=['dog', 'cat', 'person']**.
+将 COCO 2017 解压为：
 
-``` diff
-- use_coco_eval = True
-+ use_coco_eval = False
-+ label_list=['dog', 'cat', 'person']
-```
-- **Train/Eval**:
-
-```  bash
-# train/eval on torch.distributed.launch:
-bash train_dist.sh  ${GPU_NUM} ${CFG} ${DATASETS} ${OUTPUT_DIR}
-bash test_dist.sh  ${GPU_NUM} ${CFG} ${DATASETS} ${OUTPUT_DIR}
-
-# train/eval on slurm cluster：
-bash train_slurm.sh  ${PARTITION} ${GPU_NUM} ${CFG} ${DATASETS} ${OUTPUT_DIR}
-bash test_slurm.sh  ${PARTITION} ${GPU_NUM} ${CFG} ${DATASETS} ${OUTPUT_DIR}
-# e.g.  check train_slurm.sh for more details
-# bash train_slurm.sh v100_32g 32 config/cfg_odvg.py config/datasets_mixed_odvg.json ./logs
-# bash train_slurm.sh v100_32g 8 config/cfg_coco.py config/datasets_od_example.json ./logs
+```text
+/data/zk/coco_2017/
+├── train2017/
+├── val2017/
+└── annotations/
+    ├── instances_train2017.json
+    └── instances_val2017.json
 ```
 
+把训练标注转换为 ODVG：
 
-# Results and Models
+```bash
+cd /data/zk/Open-GroundingDino/tools
 
-<table style="font-size:11px;" >
-  <thead>
-    <tr style="text-align: right;">
-      <th>Name</th>
-      <th>Pretrain data</th>
-      <th>Task</th>
-      <th>mAP on COCO</th>
-      <th>Ckpt</th>
-      <th>Misc</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>GroundingDINO-T<br>(offical)</td>
-      <td>O365,GoldG,Cap4M</td>
-      <td>zero-shot</td>
-      <td>48.4<br>(zero-shot)</td>
-      <td><a href="https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth">model</a> 
-      <td> - </td>
-    </tr>
-      <td>GroundingDINO-T<br>(fine-tune)</td>
-      <td>O365,GoldG,Cap4M</td>
-      <td>finetune<br>w/ coco</td>
-      <td><b>57.3</b><br>(fine-tune)</td>
-      <td><a href="https://github.com/longzw1997/Open-GroundingDino/releases/download/v0.1.0/gdinot-coco-ft.pth">model</a> 
-      <td><a href="https://drive.google.com/file/d/1TJRAiBbVwj3AfxvQAoi1tmuRfXH1hLie/view?usp=drive_link">cfg</a> | <a href="https://drive.google.com/file/d/1u8XyvBug56SrJY85UtMZFPKUIzV3oNV6/view?usp=drive_link">log</a></td>
-    </tr>
-    <tr>
-      <td>GroundingDINO-T<br>(pretrain)</td>
-      <td>COCO,O365,LIVS,<a href="https://github.com/V3Det/V3Det">V3Det</a>,<br>GRIT-200K,<a href="https://github.com/BryanPlummer/flickr30k_entities">Flickr30k</a>(total 1.8M)</td>
-      <td>zero-shot</td>
-      <td><b>55.1</b><br>(zero-shot)</td>
-      <td><a href="https://github.com/longzw1997/Open-GroundingDino/releases/download/v0.1.0/gdinot-1.8m-odvg.pth">model</a>  
-      <td><a href='https://drive.google.com/file/d/1LwtkvBHkP1OkErKBsVfwjcedVXkyocA5/view?usp=drive_link'>cfg</a> | <a href="https://drive.google.com/file/d/1kBEFk14OqcYHC7DPdA_BGtk2TBQkJtrL/view?usp=drive_link">log</a></td>
-    </tr>
-  </tbody>
-</table>
+python coco2odvg.py \
+    --input /data/zk/coco_2017/annotations/instances_train2017.json \
+    --output /data/zk/coco_2017/annotations/coco2017_train_odvg.jsonl \
+    --idmap coco2017
 
-- [GRIT](https://huggingface.co/datasets/zzliang/GRIT)-200K generated by [GLIP](https://github.com/microsoft/GLIP) and [spaCy](https://spacy.io/).
-
-
-# Inference
-
-Because the model architecture has not changed, you only need to **install** [GroundingDINO](https://github.com/IDEA-Research/GroundingDINO) library and then run [inference_on_a_image.py](./tools/inference_on_a_image.py) to inference your images.
-
-``` bash
-python tools/inference_on_a_image.py \
-  -c tools/GroundingDINO_SwinT_OGC.py \
-  -p path/to/your/ckpt.pth \
-  -i ./figs/dog.jpeg \
-  -t "dog" \
-  -o output
+python -c "from coco2odvg import dump_label_map; dump_label_map(output='/data/zk/coco_2017/annotations/coco2017_label_map.json')"
 ```
 
-| Prompt |        Official ckpt         |        COCO ckpt         |        1.8M ckpt         |
-| :----: | :--------------------------: | :----------------------: | :----------------------: |
-|  dog   | ![](./figs/dog-official.jpg) | ![](./figs/dog-coco.jpg) | ![](./figs/dog-1.8m.jpg) |
-|  cat   | ![](./figs/cat-official.jpg) | ![](./figs/cat-coco.jpg) | ![](./figs/cat-1.8m.jpg) |
+`config/datasets_od_example.json` 已按上述路径配置。训练集使用 ODVG，验证集使用 COCO 标注。
 
-# Acknowledgments
+## 6. 准备预训练权重和 BERT
 
-Provided codes were adapted from:
+权重与 BERT 文件不提交到 Git，请放入：
 
-- [microsoft/GLIP](https://github.com/microsoft/GLIP)
-- [IDEA-Research/DINO](https://github.com/IDEA-Research/DINO/)
-- [IDEA-Research/GroundingDINO](https://github.com/IDEA-Research/GroundingDINO)
-
-
-# Citation
-
-```
-@misc{Open Grounding Dino,
-  author = {Zuwei Long, Wei Li},
-  title = {Open Grounding Dino:The third party implementation of the paper Grounding DINO},
-  howpublished = {\url{https://github.com/longzw1997/Open-GroundingDino}},
-  year = {2023}
-}
+```text
+/data/zk/Open-GroundingDino/ckpts/
+├── groundingdino_swint_ogc.pth
+├── groundingdino_swinb_cogcoor.pth
+└── bert-base-uncased/
 ```
 
-# Contact
+下载 BERT：
 
-- longzuwei at sensetime.com  
-- liwei1 at sensetime.com  
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+huggingface-cli download bert-base-uncased \
+    --local-dir /data/zk/Open-GroundingDino/ckpts/bert-base-uncased
+```
 
-Feel free to contact we if you have any suggestions or questions. Bugs found are also welcome. Please create a pull request if you find any bugs or want to contribute code.
+## 7. 训练 Swin-T
+
+Swin-T 配置为 `config/cfg_coco.py`：
+
+```python
+backbone = 'swin_T_224_1k'
+batch_size = 4
+```
+
+选择一张空闲 DCU 并启动训练：
+
+```bash
+cd /data/zk/Open-GroundingDino
+export HIP_VISIBLE_DEVICES=5
+
+PRETRAIN_MODEL_PATH=/data/zk/Open-GroundingDino/ckpts/groundingdino_swint_ogc.pth \
+TEXT_ENCODER_TYPE=/data/zk/Open-GroundingDino/ckpts/bert-base-uncased \
+bash train_dist.sh \
+    1 \
+    config/cfg_coco.py \
+    config/datasets_od_example.json \
+    ./logs_swint
+```
+
+## 8. 训练 Swin-B
+
+Swin-B 使用独立配置 `config/cfg_coco_swinb.py`，避免修改或覆盖 Swin-T 配置：
+
+```python
+backbone = 'swin_B_384_22k'
+batch_size = 4
+```
+
+启动训练：
+
+```bash
+cd /data/zk/Open-GroundingDino
+export HIP_VISIBLE_DEVICES=5
+
+PRETRAIN_MODEL_PATH=/data/zk/Open-GroundingDino/ckpts/groundingdino_swinb_cogcoor.pth \
+TEXT_ENCODER_TYPE=/data/zk/Open-GroundingDino/ckpts/bert-base-uncased \
+bash train_dist_swinb.sh \
+    1 \
+    config/cfg_coco_swinb.py \
+    config/datasets_od_example.json \
+    ./logs_swinb
+```
+
+当前服务器已使用单卡 `batch_size=4` 完成 Swin-B 训练验证。Swin-B 显存占用显著高于 Swin-T；如果更换输入尺度、数据增强或设备后出现显存不足，可先把该值降为 1，再根据显存余量逐步增加。
+
+### 权重必须与配置匹配
+
+```text
+cfg_coco.py        + groundingdino_swint_ogc.pth
+cfg_coco_swinb.py  + groundingdino_swinb_cogcoor.pth
+```
+
+如果 Swin-B 配置误加载 Swin-T 权重，会出现 `size mismatch`，例如 checkpoint 通道为 384/768，而当前模型通道为 512/1024。`strict=False` 不能忽略同名参数的形状不一致。
+
+## 9. 参数含义、多卡和断点续训
+
+命令中的第一个数字表示训练进程数（可见 DCU 数量），不是 batch size。全局 batch size 为：
+
+```text
+配置文件中的 batch_size × DCU 数量
+```
+
+例如使用 4 张卡训练 Swin-T：
+
+```bash
+export HIP_VISIBLE_DEVICES=0,1,2,3
+
+PRETRAIN_MODEL_PATH=/data/zk/Open-GroundingDino/ckpts/groundingdino_swint_ogc.pth \
+TEXT_ENCODER_TYPE=/data/zk/Open-GroundingDino/ckpts/bert-base-uncased \
+bash train_dist.sh 4 \
+    config/cfg_coco.py \
+    config/datasets_od_example.json \
+    ./logs_swint_4dcu
+```
+
+如果输出目录中已有 `checkpoint.pth`，`main.py` 会自动断点续训。开始新实验时必须使用新的空目录，Swin-T 和 Swin-B 不得共用输出目录。
+
+训练脚本中不能添加 `--eval`；该参数只用于验证。
+
+## 10. 验证模型
+
+验证 Swin-T：
+
+```bash
+export HIP_VISIBLE_DEVICES=5
+
+PRETRAIN_MODEL_PATH=/data/zk/Open-GroundingDino/ckpts/groundingdino_swint_ogc.pth \
+TEXT_ENCODER_TYPE=/data/zk/Open-GroundingDino/ckpts/bert-base-uncased \
+bash test_dist.sh 1 \
+    config/cfg_coco.py \
+    config/datasets_od_example.json \
+    ./eval_swint
+```
+
+验证 Swin-B：
+
+```bash
+export HIP_VISIBLE_DEVICES=5
+
+PRETRAIN_MODEL_PATH=/data/zk/Open-GroundingDino/ckpts/groundingdino_swinb_cogcoor.pth \
+TEXT_ENCODER_TYPE=/data/zk/Open-GroundingDino/ckpts/bert-base-uncased \
+bash test_dist.sh 1 \
+    config/cfg_coco_swinb.py \
+    config/datasets_od_example.json \
+    ./eval_swinb
+```
+
+## 11. 已验证结果
+
+在 BW100 单卡上已完成以下验证：
+
+- DCU 自定义算子前向精度测试通过；
+- `D=30/32/64/71` 梯度检查通过；
+- Swin-T、batch size 4 完成前向、反向传播和多 iteration 训练；
+- Swin-B 权重与 `swin_B_384_22k` 模型参数完全匹配，并已完成训练验证。
+
+## 12. 注意事项
+
+- `ckpts/`、训练日志、checkpoint、编译目录和 Python 缓存不应提交到 Git。
+- `torch.distributed.launch` 会输出弃用警告，但当前环境仍可正常训练；后续可迁移到 `torchrun`。
+- 首个 iteration 包含初始化开销，耗时通常明显高于后续 iteration。
+- 修改 backbone 后必须同步切换预训练权重与输出目录。
+
+## License
+
+本项目沿用上游仓库的 [Apache License 2.0](LICENSE)。

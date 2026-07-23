@@ -10,10 +10,20 @@ import os
 import glob
 
 import torch
+import torch.utils.cpp_extension as cpp_extension
 
-from torch.utils.cpp_extension import CUDA_HOME
-from torch.utils.cpp_extension import CppExtension
-from torch.utils.cpp_extension import CUDAExtension
+CppExtension = cpp_extension.CppExtension
+CUDAExtension = cpp_extension.CUDAExtension
+
+CUDA_HOME = cpp_extension.CUDA_HOME
+
+if CUDA_HOME is None:
+    CUDA_HOME = os.environ.get("CUDA_HOME")
+
+if CUDA_HOME is None:
+    CUDA_HOME = "/opt/dtk/cuda/cuda-12"
+
+cpp_extension.CUDA_HOME = CUDA_HOME
 
 from setuptools import find_packages
 from setuptools import setup
